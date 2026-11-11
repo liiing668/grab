@@ -141,6 +141,14 @@ class NetworkServiceMulticurl(BaseService):
         while not worker.stop_event.is_set():
             worker.process_pause_signal()
             self.process_handlers()
+            # Collecting results lives in the async loop thread (and
+            # not in the spawner thread), so that a spawner blocked
+            # on the in-flight capacity limit cannot stall the
+            # delivery of finished network results.
+            for result, task in self.iterate_results():
+                self.spider.task_dispatcher.input_queue.put(
+                    (result, task, None),
+                )
             time.sleep(0.01)
 
     def spawner_callback(self, worker):
@@ -157,8 +165,25 @@ class NetworkServiceMulticurl(BaseService):
                         is_valid, reason = self.spider.check_task_limits(task)
                         if is_valid:
                             grab = self.spider.setup_grab_for_task(task)
-                            self.spider.submit_task_to_transport(task, grab)
+                            # Take an in-flight slot before the
+                            # network attempt. If the task carries a
+                            # token from the cache reader (cache miss)
+                            # no extra slot is taken.
+                            inflight_token = (
+                                self.spider.acquire_inflight_token(task)
+                            )
+                            if inflight_token is not False:
+                                try:
+                                    self.spider.submit_task_to_transport(
+                                        task, grab
+                                    )
+                                except Exception:
+                                    self.spider.discard_inflight_token(task)
+                                    raise
+                            # else: the spider is shutting down,
+                            # drop the task
                         else:
+                            self.spider.discard_inflight_token(task)
                             self.spider.log_rejected_task(task, reason)
                             # pylint: disable=no-member
                             handler = task.get_fallback_handler(self.spider)
@@ -167,11 +192,6 @@ class NetworkServiceMulticurl(BaseService):
                                 handler(task)
                     finally:
                         worker.is_busy_event.clear()
-
-            for result, task in self.iterate_results():
-                self.spider.task_dispatcher.input_queue.put(
-                    (result, task, None),
-                )
 
     def ready_for_task(self):
         return len(self.freelist)

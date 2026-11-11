@@ -83,6 +83,7 @@ crawlers.
     spider/task
     spider/task_queue
     spider/cache
+    spider/inflight_limit
     spider/error_handling
     spider/transport
 

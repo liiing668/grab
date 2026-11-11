@@ -48,6 +48,14 @@ class ParserService(BaseService):
                 pass
             else:
                 worker.is_busy_event.set()
+                # Detach the in-flight token from the task, so that
+                # Task objects cloned from it (e.g. on
+                # InvalidResponseError) do not carry the token.
+                # The slot is released (finish_parse) only when the
+                # handler output has been completely consumed.
+                inflight_token = getattr(task, '_inflight_token', None)
+                if inflight_token is not None:
+                    task._inflight_token = None
                 try:
                     process_request_count += 1
                     try:
@@ -69,6 +77,8 @@ class ParserService(BaseService):
                             )
                             return
                 finally:
+                    if inflight_token is not None:
+                        inflight_token.finish_parse()
                     worker.is_busy_event.clear()
 
     def execute_task_handler(self, handler, result, task):

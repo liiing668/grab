@@ -39,7 +39,19 @@ class CacheReaderService(CacheServiceBase):
                 grab = self.spider.setup_grab_for_task(task)
                 item = None
                 if self.is_read_allowed(task, grab):
-                    item = self.load_from_cache(task, grab)
+                    # Take an in-flight slot before reading the
+                    # content from the cache. On cache miss the token
+                    # travels with the task to the network service, so
+                    # the network attempt does not take a second slot.
+                    inflight_token = self.spider.acquire_inflight_token(task)
+                    if inflight_token is False:
+                        # The spider is shutting down
+                        continue
+                    try:
+                        item = self.load_from_cache(task, grab)
+                    except Exception:
+                        self.spider.discard_inflight_token(task)
+                        raise
                     if item:
                         result, task = item
                         self.spider.task_dispatcher.input_queue.put(
@@ -84,12 +96,18 @@ class CacheWriterService(CacheServiceBase):
         while not worker.stop_event.is_set():
             worker.process_pause_signal()
             try:
-                task, grab = self.input_queue.get(True, 0.1)
+                task, grab, inflight_token = self.input_queue.get(True, 0.1)
             except Empty:
                 pass
             else:
-                if self.is_write_allowed(task, grab):
-                    self.backend.save_response(task.url, grab)
+                try:
+                    if self.is_write_allowed(task, grab):
+                        self.backend.save_response(task.url, grab)
+                finally:
+                    # The in-flight slot of the task attempt is
+                    # released only when the cache write has finished
+                    if inflight_token is not None:
+                        inflight_token.finish_cache()
 
     def is_write_allowed(self, task, grab):
         return (

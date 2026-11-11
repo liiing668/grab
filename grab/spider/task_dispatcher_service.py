@@ -70,12 +70,19 @@ class TaskDispatcherService(BaseService):
             if isinstance(result, FatalError):
                 self.spider.fatal_error_queue.put(meta["exc_info"])
         elif isinstance(result, dict) and "grab" in result:
+            inflight_token = getattr(task, "_inflight_token", None)
             if (
                 self.spider.cache_writer_service
                 and not result.get("from_cache")
                 and result["ok"]
             ):
-                self.spider.cache_writer_service.input_queue.put((task, result["grab"]))
+                if inflight_token is not None:
+                    # The in-flight slot is released only when the
+                    # cache write of the response has finished too
+                    inflight_token.expect_cache_write()
+                self.spider.cache_writer_service.input_queue.put(
+                    (task, result["grab"], inflight_token)
+                )
             # TODO: Move to network service
             # starts
             self.spider.log_network_result_stats(result, task)
@@ -89,6 +96,10 @@ class TaskDispatcherService(BaseService):
             if is_valid:
                 self.spider.parser_service.input_queue.put((result, task))
             else:
+                # The attempt has failed: free the in-flight slot.
+                # The retried task acquires a new slot when it
+                # re-enters the cache reader or the network service.
+                self.spider.discard_inflight_token(task)
                 self.spider.log_failed_network_result(result)
                 # Try to do network request one more time
                 # TODO:
